@@ -5,6 +5,245 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import requests, re, json, math, time
 from bs4 import BeautifulSoup
+
+st.set_page_config(layout="wide")
+st.title("Análise Completa de Time - Sofascore (Cloud)")
+
+# ------------------------------
+# FUNÇÕES DE EXTRAÇÃO (SEM SELENIUM)
+# ------------------------------
+
+def fetch_html(url):
+    """Obtém HTML via requests apenas, sem Selenium"""
+    headers = {"User-Agent":"Mozilla/5.0"}
+    try:
+        response = requests.get(url, headers=headers, timeout=15)
+        response.raise_for_status()
+        return response.text
+    except Exception as e:
+        st.error(f"Não foi possível obter o HTML do jogo: {e}")
+        return None
+
+def extract_json_from_html(html):
+    """Extrai JSON embutido no HTML (__INITIAL_STATE__)"""
+    patterns = [
+        r"window\.__INITIAL_STATE__\s*=\s*({.+?});\s*(?:window|\n)",
+        r"window\.__PRELOADED_STATE__\s*=\s*({.+?});",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, html, flags=re.S)
+        if match:
+            txt = match.group(1)
+            try:
+                return json.loads(txt)
+            except Exception:
+                try:
+                    cleaned = re.sub(r",\s*}", "}", txt)
+                    cleaned = re.sub(r",\s*]", "]", cleaned)
+                    return json.loads(cleaned)
+                except:
+                    pass
+    # fallback: BeautifulSoup para JSON ld+json
+    soup = BeautifulSoup(html, "lxml")
+    for script in soup.find_all("script", {"type":"application/ld+json"}):
+        try:
+            return json.loads(script.string)
+        except:
+            continue
+    return None
+
+def recursive_find_shots(obj):
+    shots = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if isinstance(k, str) and ("shot" in k.lower() or "shots" == k.lower() or "events" in k.lower()):
+                if isinstance(v, list):
+                    for e in v:
+                        if isinstance(e, dict):
+                            s = json.dumps(e).lower()
+                            if any(x in s for x in ["x", "y", "isgoal", "shot", "xpercent", "ypercent"]):
+                                shots.append(e)
+                else:
+                    shots += recursive_find_shots(v)
+            else:
+                shots += recursive_find_shots(v)
+    elif isinstance(obj, list):
+        for item in obj:
+            shots += recursive_find_shots(item)
+    return shots
+
+def normalize_event(event):
+    output = {}
+    for key in ('minute', 'time', 'min', 'matchMinute', 'minuteInMatch'):
+        if key in event:
+            output['minute'] = event.get(key)
+            break
+    for key in ('player', 'playerName', 'player_name'):
+        if key in event: output['player'] = event.get(key); break
+    for key in ('team', 'teamName'): 
+        if key in event: output['team'] = event.get(key); break
+    x = y = None
+    for k in ('x', 'xPercent'): 
+        if k in event: x = event.get(k); break
+    for k in ('y', 'yPercent'): 
+        if k in event: y = event.get(k); break
+    output['x_raw'] = x
+    output['y_raw'] = y
+    output['is_goal'] = bool(event.get('isGoal') or event.get('goal') or event.get('is_goal'))
+    output['on_target'] = event.get('onTarget', False)
+    return output
+
+def percent_to_meters(x_pct, y_pct, pitch_length=105.0, pitch_width=68.0):
+    try: xm = (float(x_pct)*pitch_length)/100.0
+    except: xm = np.nan
+    try: ym = (float(y_pct)*pitch_width)/100.0
+    except: ym = np.nan
+    return xm, ym
+
+def simple_xg_from_distance(dist_m):
+    if dist_m is None or np.isnan(dist_m): return np.nan
+    return 1.0 / (1.0 + math.exp((dist_m - 16.0)/5.0))
+
+def extract_game(url):
+    html = fetch_html(url)
+    if html is None: return None, None, None, None, None, None
+    data = extract_json_from_html(html)
+    if data is None: return None, None, None, None, None, None
+
+    # nomes dos times
+    home_team = data.get('home', {}).get('name') or data.get('events', {}).get('homeTeam', {}).get('name')
+    away_team = data.get('away', {}).get('name') or data.get('events', {}).get('awayTeam', {}).get('name')
+
+    # chutes
+    shots_blobs = recursive_find_shots(data)
+    events_home = []
+    events_away = []
+
+    for blob in shots_blobs:
+        if isinstance(blob, dict):
+            for v in blob.values():
+                if isinstance(v, list):
+                    for e in v:
+                        if isinstance(e, dict):
+                            if e.get('teamName') == home_team: events_home.append(normalize_event(e))
+                            else: events_away.append(normalize_event(e))
+
+    df_home = pd.DataFrame(events_home)
+    df_away = pd.DataFrame(events_away)
+
+    for df in [df_home, df_away]:
+        xs, ys = [], []
+        for _, row in df.iterrows():
+            xm, ym = percent_to_meters(row.get('x_raw'), row.get('y_raw'))
+            xs.append(xm)
+            ys.append(ym)
+        df['x_m'] = xs
+        df['y_m'] = ys
+        df['dist_m'] = df.apply(lambda r: math.hypot(105-r['x_m'],34-r['y_m']) if not np.isnan(r['x_m']) else np.nan, axis=1)
+        df['xG'] = df['dist_m'].apply(simple_xg_from_distance)
+        df['xGOT'] = df.apply(lambda r: r['xG'] if r.get('on_target') or r['is_goal'] else 0, axis=1)
+
+    return home_team, away_team, df_home, df_away
+
+# ------------------------------
+# STREAMLIT INTERFACE
+# ------------------------------
+
+if 'links' not in st.session_state: st.session_state.links=[]
+if 'teams' not in st.session_state: st.session_state.teams=[]
+
+st.subheader("Fase 1: Inserir Links de Jogos (até 30)")
+with st.form("add_link_form"):
+    new_link = st.text_input("Cole o link do jogo")
+    submit_link = st.form_submit_button("Adicionar Link")
+    if submit_link and new_link:
+        if len(st.session_state.links)<30:
+            st.session_state.links.append(new_link)
+            st.success("Link adicionado!")
+        else:
+            st.warning("Máximo de 30 links atingido!")
+
+st.write("Links adicionados:")
+for i, link in enumerate(st.session_state.links):
+    cols = st.columns([0.9,0.1])
+    cols[0].write(f"{i+1}. {link}")
+    if cols[1].button("Remover", key=f"rm{i}"):
+        st.session_state.links.pop(i)
+        st.experimental_rerun()
+
+# seleção do time alvo
+if st.session_state.links:
+    st.subheader("Selecione o Time Alvo")
+    teams_set = set()
+    for url in st.session_state.links:
+        h,a, *_ = extract_game(url)
+        if h: teams_set.add(h)
+        if a: teams_set.add(a)
+    st.session_state.teams = sorted(list(teams_set))
+    team_name = st.selectbox("Escolha o time alvo:", st.session_state.teams)
+else:
+    team_name = None
+
+# processamento
+if st.button("Processar Jogos") and team_name:
+    st.subheader("Processamento dos Jogos")
+    all_team=[]
+    all_opp=[]
+    for i, url in enumerate(st.session_state.links,1):
+        st.write(f"Processando {i}/{len(st.session_state.links)}")
+        h,a, df_home, df_away = extract_game(url)
+        if df_home is None: continue
+        if team_name==h:
+            df_team, df_opp = df_home.copy(), df_away.copy()
+            location_team="HOME"
+        else:
+            df_team, df_opp = df_away.copy(), df_home.copy()
+            location_team="AWAY"
+
+        df_team['Jogo']=f"Jogo_{i}"
+        df_team['location']=location_team
+        df_opp['Jogo']=f"Jogo_{i}"
+        df_opp['location']="AWAY" if location_team=="HOME" else "HOME"
+
+        all_team.append(df_team)
+        all_opp.append(df_opp)
+
+    if not all_team:
+        st.error("Nenhum dado extraído.")
+    else:
+        df_all_team = pd.concat(all_team, ignore_index=True)
+        df_all_opp = pd.concat(all_opp, ignore_index=True)
+        st.success("Jogos processados!")
+
+        excel_file="team_database_cloud.xlsx"
+        with pd.ExcelWriter(excel_file, engine='openpyxl') as writer:
+            for i, df in enumerate(all_team,1):
+                df.to_excel(writer, sheet_name=f"Jogo_{i}_shots", index=False)
+        st.download_button("Download Excel", data=open(excel_file,"rb").read(), file_name=excel_file)
+
+        # heatmaps
+        st.subheader("Heatmap de Chutes do Time")
+        plt.figure(figsize=(10,6))
+        sns.kdeplot(x='x_m', y='y_m', data=df_all_team, fill=True, cmap="Reds", bw_adjust=0.5)
+        plt.title("Heatmap de Chutes (xG/xGOT)")
+        plt.xlim(0,105)
+        plt.ylim(0,68)
+        st.pyplot(plt)
+
+        st.subheader("Heatmap de Chutes Sofridos (Goleiro)")
+        plt.figure(figsize=(10,6))
+        sns.kdeplot(x='x_m', y='y_m', data=df_all_opp, fill=True, cmap="Blues", bw_adjust=0.5)
+        plt.title("Heatmap de Chutes Sofridos")
+        plt.xlim(0,105)
+        plt.ylim(0,68)
+        st.pyplot(plt)
+import streamlit as st
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import requests, re, json, math, time
+from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from webdriver_manager.chrome import ChromeDriverManager
@@ -310,3 +549,4 @@ if st.button("Processar Jogos") and team_name:
 
         st.subheader("Estatísticas do Adversário")
         st.dataframe(df_stats_opp)
+
