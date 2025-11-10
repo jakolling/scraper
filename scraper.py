@@ -10,7 +10,7 @@ from selenium.webdriver.chrome.options import Options
 from webdriver_manager.chrome import ChromeDriverManager
 
 st.set_page_config(layout="wide")
-st.title("Análise Completa de Performance do Time com Heatmaps e Estatísticas")
+st.title("Análise Completa do Time - Sofascore")
 
 # ------------------------------
 # FUNÇÕES DE EXTRAÇÃO
@@ -121,12 +121,13 @@ def extract_game(url, team_name):
     if data is None:
         return None
 
-    # Times
+    # Times e local
     home_team = data.get('events', data).get('homeTeam', {}).get('name') or data.get('home', {}).get('name')
     away_team = data.get('events', data).get('awayTeam', {}).get('name') or data.get('away', {}).get('name')
     location = "HOME" if team_name == home_team else "AWAY"
     opponent = away_team if location=="HOME" else home_team
 
+    # Shots
     shots_blobs = recursive_find_shots(data)
     events_team = []
     events_opp = []
@@ -164,7 +165,20 @@ def extract_game(url, team_name):
         df['opponent'] = opponent
         df['location'] = location
 
-    return df_team, df_opp, opponent, location
+    # Estatísticas do time (aba "Statistics" Sofascore)
+    stats_team = data.get('events', data).get('homeTeamStatistics') if location=="HOME" else data.get('events', data).get('awayTeamStatistics')
+    stats_opp = data.get('events', data).get('awayTeamStatistics') if location=="HOME" else data.get('events', data).get('homeTeamStatistics')
+
+    stats_dict = {}
+    if stats_team:
+        for s in stats_team.get('statistics', []):
+            stats_dict[s['type']] = s.get('value')
+    stats_dict_op = {}
+    if stats_opp:
+        for s in stats_opp.get('statistics', []):
+            stats_dict_op[s['type']] = s.get('value')
+
+    return df_team, df_opp, opponent, location, stats_dict, stats_dict_op
 
 # ------------------------------
 # STREAMLIT INTERFACE
@@ -173,34 +187,46 @@ def extract_game(url, team_name):
 if 'links' not in st.session_state:
     st.session_state.links = []
 
-# Input de links
+st.subheader("Fase 1: Inserir Links de Jogos")
 new_link = st.text_input("Cole o link do jogo e pressione Enter")
 if new_link:
     st.session_state.links.append(new_link)
     st.success("Link adicionado!")
 
+# Listagem com botão remover
 st.write("Links adicionados:")
-for i, link in enumerate(st.session_state.links,1):
-    st.write(f"{i}. {link}")
+for i, link in enumerate(st.session_state.links):
+    cols = st.columns([0.9,0.1])
+    cols[0].write(f"{i+1}. {link}")
+    if cols[1].button("Remover", key=f"remove_{i}"):
+        st.session_state.links.pop(i)
+        st.experimental_rerun()
 
 team_name = st.text_input("Digite o nome do time alvo")
 
-# Filtros de visualização
-selected_jogador = st.selectbox("Filtrar por jogador (opcional)", ["Todos"])
-selected_location = st.selectbox("Filtrar por local", ["Todos","HOME","AWAY"])
-selected_jogo = st.selectbox("Filtrar por jogo", ["Todos"] + [f"Jogo_{i+1}" for i in range(len(st.session_state.links))])
-
 if st.button("Processar Jogos") and team_name:
+    st.subheader("Fase 2: Processamento dos Dados e Criação do Excel")
     all_team = []
     all_opp = []
+    all_stats_team = []
+    all_stats_opp = []
     for i, url in enumerate(st.session_state.links,1):
         st.write(f"Processando {i}/{len(st.session_state.links)}")
-        df_team, df_opp, opponent, location = extract_game(url, team_name)
-        if df_team is not None:
+        result = extract_game(url, team_name)
+        if result is not None:
+            df_team, df_opp, opponent, location, stats_team, stats_opp = result
             df_team['Jogo'] = f"Jogo_{i}"
             df_opp['Jogo'] = f"Jogo_{i}"
             all_team.append(df_team)
             all_opp.append(df_opp)
+            stats_team['Jogo'] = f"Jogo_{i}"
+            stats_team['location'] = location
+            stats_team['opponent'] = opponent
+            stats_opp['Jogo'] = f"Jogo_{i}"
+            stats_opp['location'] = location
+            stats_opp['opponent'] = opponent
+            all_stats_team.append(stats_team)
+            all_stats_opp.append(stats_opp)
         else:
             st.warning(f"Nenhum dado para {team_name} nesse jogo.")
 
@@ -209,6 +235,32 @@ if st.button("Processar Jogos") and team_name:
     else:
         df_all_team = pd.concat(all_team, ignore_index=True)
         df_all_opp = pd.concat(all_opp, ignore_index=True)
+        df_stats_team = pd.DataFrame(all_stats_team)
+        df_stats_opp = pd.DataFrame(all_stats_opp)
+
+        st.success("Dataframe completo e Excel gerado com todas as estatísticas do time e adversário.")
+
+        # Exportação Excel
+        excel_file = "team_database_full.xlsx"
+        with pd.ExcelWriter(excel_file, engine='openpyxl') as writer:
+            for i, df in enumerate(all_team,1):
+                df.to_excel(writer, sheet_name=f"Jogo_{i}_shots", index=False)
+            df_stats_team.to_excel(writer, sheet_name="Stats_Time", index=False)
+            df_stats_opp.to_excel(writer, sheet_name="Stats_Adversario", index=False)
+        st.download_button("Download Excel Completo", data=open(excel_file,"rb").read(), file_name=excel_file)
+
+        # ------------------------------
+        # Fase 2: Análise interativa
+        # ------------------------------
+        st.subheader("Fase 2: Análise do Time")
+
+        # Filtros dinâmicos
+        jogadores = ["Todos"] + sorted(df_all_team['player'].dropna().unique().tolist())
+        selected_jogador = st.selectbox("Filtrar por jogador (opcional)", jogadores)
+        locais = ["Todos"] + sorted(df_all_team['location'].dropna().unique().tolist())
+        selected_location = st.selectbox("Filtrar por local", locais)
+        jogos = ["Todos"] + sorted(df_all_team['Jogo'].unique().tolist())
+        selected_jogo = st.selectbox("Filtrar por jogo", jogos)
 
         # Aplicar filtros
         df_plot_team = df_all_team.copy()
@@ -222,9 +274,7 @@ if st.button("Processar Jogos") and team_name:
             df_plot_team = df_plot_team[df_plot_team['Jogo']==selected_jogo]
             df_plot_opp = df_plot_opp[df_plot_opp['Jogo']==selected_jogo]
 
-        # ------------------------------
-        # Heatmaps do time
-        # ------------------------------
+        # Heatmaps
         st.subheader("Heatmap de Chutes do Time")
         if not df_plot_team.empty:
             plt.figure(figsize=(10,6))
@@ -236,9 +286,6 @@ if st.button("Processar Jogos") and team_name:
         else:
             st.info("Nenhum chute do time no filtro selecionado.")
 
-        # ------------------------------
-        # Heatmaps do goleiro
-        # ------------------------------
         st.subheader("Heatmap de Chutes Sofridos (Goleiro)")
         if not df_plot_opp.empty:
             plt.figure(figsize=(10,6))
@@ -250,58 +297,8 @@ if st.button("Processar Jogos") and team_name:
         else:
             st.info("Nenhum chute sofrido nesse filtro.")
 
-        # ------------------------------
-        # Estatísticas agregadas
-        # ------------------------------
-        resumo = pd.DataFrame({
-            'Total_Chutes':[len(df_all_team)],
-            'Total_Gols':[df_all_team['is_goal'].sum()],
-            'xG_total':[df_all_team['xG'].sum()],
-            'xGOT_total':[df_all_team['xGOT'].sum()],
-            'Média_xG_por_jogo':[df_all_team['xG'].sum()/len(all_team)],
-            'Média_xGOT_por_jogo':[df_all_team['xGOT'].sum()/len(all_team)],
-            'Conversão_chutes':[df_all_team['is_goal'].sum()/len(df_all_team)*100 if len(df_all_team)>0 else 0],
-            'Jogos':[len(all_team)]
-        })
+        st.subheader("Exibir Estatísticas do Time (seleção filtrada)")
+        st.dataframe(df_stats_team)
 
-        by_player = df_all_team.groupby(['player','location'], dropna=False).agg(
-            Chutes=('xG','count'),
-            Gols=('is_goal','sum'),
-            xG=('xG','sum'),
-            xGOT=('xGOT','sum')
-        ).reset_index()
-
-        by_location = df_all_team.groupby('location').agg(
-            Chutes=('xG','count'),
-            Gols=('is_goal','sum'),
-            xG=('xG','sum'),
-            xGOT=('xGOT','sum')
-        ).reset_index()
-
-        goleiro = df_all_opp.groupby('location').agg(
-            Chutes_sofridos=('xG','count'),
-            Gols_sofridos=('is_goal','sum'),
-            xG_sofrido=('xG','sum'),
-            xGOT_sofrido=('xGOT','sum')
-        ).reset_index()
-
-        st.subheader("Resumo geral do time")
-        st.dataframe(resumo)
-        st.subheader("Stats por jogador")
-        st.dataframe(by_player)
-        st.subheader("Stats por local (HOME/AWAY)")
-        st.dataframe(by_location)
-        st.subheader("Stats do goleiro")
-        st.dataframe(goleiro)
-
-        # Exportação Excel
-        excel_file = "team_database.xlsx"
-        with pd.ExcelWriter(excel_file, engine='openpyxl') as writer:
-            for i, df in enumerate(all_team,1):
-                df.to_excel(writer, sheet_name=f"Jogo_{i}", index=False)
-            resumo.to_excel(writer, sheet_name="Resumo", index=False)
-            by_player.to_excel(writer, sheet_name="Por_Jogador", index=False)
-            by_location.to_excel(writer, sheet_name="Por_Local", index=False)
-            goleiro.to_excel(writer, sheet_name="Goleiro", index=False)
-        st.success(f"Excel gerado: {excel_file}")
-        st.download_button("Download Excel", data=open(excel_file,"rb").read(), file_name=excel_file)
+        st.subheader("Exibir Estatísticas do Adversário (seleção filtrada)")
+        st.dataframe(df_stats_opp)
