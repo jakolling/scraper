@@ -550,3 +550,4 @@ if st.button("Processar Jogos") and team_name:
         st.subheader("Estatísticas do Adversário")
         st.dataframe(df_stats_opp)
 
+
