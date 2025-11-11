@@ -2,4 +2,5 @@ streamlit
 pandas
 streamlit-drawable-canvas
 openpyxl
+matplotlib.pyplot
 
